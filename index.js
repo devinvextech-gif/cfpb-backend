@@ -244,63 +244,203 @@ async function scrapeDashboard(page) {
     await page.waitForLoadState('networkidle', { timeout: 30_000 });
   } catch (_) { /* best effort */ }
 
-  const dashboardUrl = page.url();
-  console.log('[scrapeDashboard] Landed on dashboard:', dashboardUrl);
+  console.log('[scrapeDashboard] Landed on dashboard:', page.url());
 
-  // Extract the dashboard summary cards (e.g., active, past due, unread) just in case
-  const dashboardSummary = await page.evaluate(() => {
-    return [...document.querySelectorAll('article, .forceCommunityTileMenu, .slds-card, [class*="card"], [class*="tile"]')]
-      .map(c => c.innerText.trim())
-      .filter(Boolean);
-  });
-
+  // ── Step 1: Navigate to Complaints tab ──────────────────────────────────────
   console.log('[scrapeDashboard] Clicking Complaints tab...');
   try {
-    // Attempt to click the Complaints tab in the navigation menu
     await page.click('a:has-text("Complaints"), a[title="Complaints"]', { timeout: 15_000 });
     await page.waitForLoadState('networkidle', { timeout: 30_000 });
-    console.log('[scrapeDashboard] Navigated to Complaints tab:', page.url());
-    
-    // Wait a bit to ensure the data table is rendered
+    console.log('[scrapeDashboard] On Complaints page:', page.url());
+    // Wait for the data table to fully render
     await page.waitForTimeout(5000);
   } catch (err) {
-    console.warn('[scrapeDashboard] Could not click "Complaints" tab or wait for load:', err.message);
+    console.warn('[scrapeDashboard] Could not navigate to Complaints:', err.message);
   }
 
-  const url = page.url();
-  const title = await page.title();
+  // ── Step 2: Hover & click the top complaint ID link ─────────────────────────
+  console.log('[scrapeDashboard] Looking for top complaint link...');
+  let complaintDetailData = null;
 
-  // Grab all visible text blocks, headings, links, and table data
-  const raw = await page.evaluate(() => {
-    const getText = (selector) =>
-      [...document.querySelectorAll(selector)].map((el) => el.innerText.trim()).filter(Boolean);
+  try {
+    // Find all table rows that have an anchor with /s/complaint-detail or /s/detail
+    const topLink = await page.locator(
+      'table tbody tr:first-child td a[href*="complaint-detail"], table tbody tr:first-child td a[href*="/s/detail"]'
+    ).first();
 
-    const getLinks = () =>
-      [...document.querySelectorAll('a[href]')].map((a) => ({
-        text: a.innerText.trim(),
-        href: a.href,
-      })).filter((l) => l.text);
+    // Fallback: any anchor in first data row of any table
+    let link = topLink;
+    if ((await link.count()) === 0) {
+      link = page.locator('table tr:nth-child(2) td a, table tbody tr:first-child td a').first();
+    }
 
-    const getTables = () =>
-      [...document.querySelectorAll('table')].map((t) => {
-        const headers = [...t.querySelectorAll('th')].map((h) => h.innerText.trim());
-        const rows = [...t.querySelectorAll('tr')].map((r) =>
-          [...r.querySelectorAll('td')].map((d) => d.innerText.trim())
-        ).filter((r) => r.length > 0);
-        return { headers, rows };
+    if ((await link.count()) > 0) {
+      const complaintId = (await link.innerText()).trim();
+      const detailHref = await link.getAttribute('href');
+      console.log(`[scrapeDashboard] Hovering over top complaint: ${complaintId} -> ${detailHref}`);
+
+      // Hover first to trigger any tooltip/preview
+      await link.hover();
+      await page.waitForTimeout(800);
+
+      // Click and navigate to the detail page
+      console.log(`[scrapeDashboard] Clicking complaint: ${complaintId}`);
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'networkidle', timeout: 45_000 }).catch(() => {}),
+        link.click(),
+      ]);
+
+      // Extra wait for Salesforce LWC components to fully render
+      await page.waitForTimeout(4000);
+      try { await page.waitForLoadState('networkidle', { timeout: 15_000 }); } catch (_) {}
+
+      const detailUrl = page.url();
+      console.log('[scrapeDashboard] Detail page URL:', detailUrl);
+
+      // ── Step 3: Extract all complaint detail data ──────────────────────────
+      complaintDetailData = await page.evaluate(() => {
+        const clean = (s) => (s || '').trim().replace(/\s+/g, ' ');
+
+        // Helper: get label-value pairs from Salesforce layout
+        const extractLabelValue = (scopeSelector) => {
+          const result = {};
+          const scope = scopeSelector ? document.querySelector(scopeSelector) : document;
+          if (!scope) return result;
+          scope.querySelectorAll(
+            '.slds-form-element, .forcePageBlockItem, [class*="formElement"], [class*="field"]'
+          ).forEach((el) => {
+            const labelEl = el.querySelector(
+              '.slds-form-element__label, label, .fieldLabel, .test-id__field-label, dt'
+            );
+            const valueEl = el.querySelector(
+              '.slds-form-element__control, .fieldValue, .test-id__field-value, dd, ' +
+              'lightning-formatted-text, span[class*="value"], p, .outputLookupLink'
+            );
+            if (labelEl && valueEl) {
+              const lbl = clean(labelEl.innerText);
+              const val = clean(valueEl.innerText);
+              if (lbl && val) result[lbl] = val;
+            }
+          });
+          return result;
+        };
+
+        // Complaint ID from URL hash or heading
+        const idFromHash = window.location.hash.replace('#', '');
+        const headingEl = document.querySelector('h1, h2, [class*="title"]');
+        const complaintId = clean(headingEl?.innerText) || idFromHash;
+
+        // Status sidebar
+        const statusEl = document.querySelector('.COMPLAINT_STATUS, [class*="complaintStatus"], [class*="status"]');
+        const complaintStatus = clean(statusEl?.innerText) || '';
+
+        // Primary consumer info
+        const consumerSection = (() => {
+          const allText = [...document.querySelectorAll('h2, h3')]
+            .find(h => /primary consumer/i.test(h.innerText));
+          return allText?.closest('section, div.slds-card, div.forcePageBlockSection') || null;
+        })();
+
+        const getSection = (regex) => {
+          const heading = [...document.querySelectorAll('h2, h3, h4, .slds-text-heading, .sectionHeader')]
+            .find(h => regex.test(h.innerText));
+          return heading?.closest('section, div.slds-card, div.forcePageBlockSection, div') || null;
+        };
+
+        // Generic field extraction across the whole page
+        const allFields = {};
+        document.querySelectorAll(
+          '.slds-form-element, .forcePageBlockItem, dl dt, [data-field-name]'
+        ).forEach((el) => {
+          const isLabel = el.tagName === 'DT' || el.matches('.slds-form-element, .forcePageBlockItem');
+          let lbl = '', val = '';
+          if (el.tagName === 'DT') {
+            lbl = clean(el.innerText);
+            val = clean(el.nextElementSibling?.innerText || '');
+          } else {
+            const labelEl = el.querySelector(
+              '.slds-form-element__label, label, .fieldLabel, dt, .test-id__field-label'
+            );
+            const valueEl = el.querySelector(
+              '.slds-form-element__control, .fieldValue, dd, lightning-formatted-text, ' +
+              '.outputLookupLink, .test-id__field-value, span, p'
+            );
+            lbl = clean(labelEl?.innerText || '');
+            val = clean(valueEl?.innerText || '');
+          }
+          if (lbl && val && lbl !== val) allFields[lbl] = val;
+        });
+
+        // Attachments
+        const attachments = [...document.querySelectorAll(
+          'a[href*="download"], a[href*="shepherd"], .slds-file-selector, [class*="attachment"] a, [class*="file"] a'
+        )].map(a => ({
+          name: clean(a.innerText) || clean(a.getAttribute('title') || ''),
+          href: a.href,
+        })).filter(a => a.name);
+
+        // "What happened" narrative
+        const narrativeEl = document.querySelector(
+          '[class*="narrative"], [class*="description"], .slds-rich-text-area'
+        );
+        const narrative = clean(narrativeEl?.innerText || '');
+
+        // Extract all visible text sections by heading
+        const sections = {};
+        document.querySelectorAll('h2, h3').forEach(heading => {
+          const title = clean(heading.innerText);
+          if (!title) return;
+          let next = heading.nextElementSibling;
+          let content = '';
+          while (next && !['H1','H2','H3'].includes(next.tagName)) {
+            content += ' ' + clean(next.innerText);
+            next = next.nextElementSibling;
+          }
+          if (content.trim()) sections[title] = content.trim();
+        });
+
+        // Complaint status sidebar
+        const sidebarItems = {};
+        document.querySelectorAll('[class*="sidebar"] dt, [class*="sidebar"] dd').forEach((el, idx, arr) => {
+          if (el.tagName === 'DT') {
+            const lbl = clean(el.innerText);
+            const val = clean(arr[idx + 1]?.innerText || '');
+            if (lbl) sidebarItems[lbl] = val;
+          }
+        });
+
+        // Response options (radio buttons)
+        const responseOptions = [...document.querySelectorAll('input[type="radio"]')]
+          .map(r => clean(r.closest('label, [role="radio"]')?.innerText || r.value))
+          .filter(Boolean);
+
+        return {
+          complaintId,
+          detailUrl: window.location.href,
+          complaintStatus,
+          allFields,
+          sections,
+          sidebarItems,
+          attachments,
+          narrative,
+          responseOptions,
+          pageTitle: document.title,
+        };
       });
 
-    return {
-      headings: getText('h1, h2, h3'),
-      paragraphs: getText('p'),
-      lists: getText('li'),
-      links: getLinks(),
-      tables: getTables(),
-      bodyText: document.body.innerText.slice(0, 5000), // first 5k chars
-    };
-  });
+      console.log('[scrapeDashboard] Extracted detail data for:', complaintDetailData.complaintId);
+    } else {
+      console.warn('[scrapeDashboard] No complaint links found in the table.');
+    }
+  } catch (err) {
+    console.error('[scrapeDashboard] Error navigating to complaint detail:', err.message);
+  }
 
-  return { url, title, scrapedAt: new Date().toISOString(), dashboardSummary, ...raw };
+  return {
+    url: page.url(),
+    scrapedAt: new Date().toISOString(),
+    complaintDetail: complaintDetailData,
+  };
 }
 
 // ── GET /status ───────────────────────────────────────────────────────────────
