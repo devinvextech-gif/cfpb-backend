@@ -244,6 +244,29 @@ async function scrapeDashboard(page) {
     await page.waitForLoadState('networkidle', { timeout: 30_000 });
   } catch (_) { /* best effort */ }
 
+  const dashboardUrl = page.url();
+  console.log('[scrapeDashboard] Landed on dashboard:', dashboardUrl);
+
+  // Extract the dashboard summary cards (e.g., active, past due, unread) just in case
+  const dashboardSummary = await page.evaluate(() => {
+    return [...document.querySelectorAll('article, .forceCommunityTileMenu, .slds-card, [class*="card"], [class*="tile"]')]
+      .map(c => c.innerText.trim())
+      .filter(Boolean);
+  });
+
+  console.log('[scrapeDashboard] Clicking Complaints tab...');
+  try {
+    // Attempt to click the Complaints tab in the navigation menu
+    await page.click('a:has-text("Complaints"), a[title="Complaints"]', { timeout: 15_000 });
+    await page.waitForLoadState('networkidle', { timeout: 30_000 });
+    console.log('[scrapeDashboard] Navigated to Complaints tab:', page.url());
+    
+    // Wait a bit to ensure the data table is rendered
+    await page.waitForTimeout(5000);
+  } catch (err) {
+    console.warn('[scrapeDashboard] Could not click "Complaints" tab or wait for load:', err.message);
+  }
+
   const url = page.url();
   const title = await page.title();
 
@@ -277,7 +300,7 @@ async function scrapeDashboard(page) {
     };
   });
 
-  return { url, title, scrapedAt: new Date().toISOString(), ...raw };
+  return { url, title, scrapedAt: new Date().toISOString(), dashboardSummary, ...raw };
 }
 
 // ── GET /status ───────────────────────────────────────────────────────────────
