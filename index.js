@@ -505,11 +505,12 @@ async function scrapeDashboard(page) {
         parsed = parsed[0]; // Extract first object if array
       }
       webhookResponse = parsed;
-      console.log('[scrapeDashboard] Parsed webhook response:', webhookResponse);
+      console.log('[scrapeDashboard] Parsed webhook response as JSON.');
     } catch(e) {
-      console.warn('[scrapeDashboard] Webhook response was not valid JSON (parsing failed). Attempting extraction...');
+      console.warn('[scrapeDashboard] Webhook response is not standard JSON. Attempting extraction...');
       // Fallback: Try to find a JSON object or array within the text response
       const jsonMatch = n8nResult.responseText.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
+      let extracted = false;
       if (jsonMatch) {
         try {
           let parsed = JSON.parse(jsonMatch[0]);
@@ -517,14 +518,48 @@ async function scrapeDashboard(page) {
             parsed = parsed[0];
           }
           webhookResponse = parsed;
-          console.log('[scrapeDashboard] Extracted webhook response:', webhookResponse);
-        } catch(fallbackErr) {
-          console.warn('[scrapeDashboard] Fallback extraction failed:', fallbackErr.message);
-        }
+          extracted = true;
+          console.log('[scrapeDashboard] Extracted webhook response from text.');
+        } catch(fallbackErr) {}
+      }
+      
+      // If it's pure raw text (like the logs show), wrap it so the rest of the code works
+      if (!extracted) {
+        console.log('[scrapeDashboard] Webhook returned raw text. Wrapping it automatically.');
+        webhookResponse = { complaint_response: n8nResult.responseText.trim() };
       }
     }
   }
   
+  if (webhookResponse && webhookResponse.complaint_response) {
+    try {
+      console.log('\n[scrapeDashboard] --- Automating Original Portal Response ---');
+      
+      const optionLabel = page.locator('label:has-text("Closed with explanation"), [role="radio"]:has-text("Closed with explanation"), span:has-text("Closed with explanation")').first();
+      
+      if ((await optionLabel.count()) > 0) {
+        await optionLabel.click();
+        console.log('[scrapeDashboard] ✔ Clicked option: "Closed with explanation"');
+        
+        await page.waitForTimeout(1500); // Wait for textarea to appear
+        
+        const textarea = page.locator('textarea').first();
+        if ((await textarea.count()) > 0) {
+          await textarea.fill(webhookResponse.complaint_response);
+          console.log(`[scrapeDashboard] ✔ Pasted the following text into the original portal textarea:\n\n${webhookResponse.complaint_response}\n`);
+          console.log('[scrapeDashboard] Note: Response was NOT submitted per instructions.');
+        } else {
+          console.warn('[scrapeDashboard] ⚠ Textarea not found after clicking the option.');
+        }
+      } else {
+         console.warn('[scrapeDashboard] ⚠ Could not find the "Closed with explanation" option on the page.');
+      }
+      console.log('[scrapeDashboard] ---------------------------------------------\n');
+    } catch (e) {
+      console.error('[scrapeDashboard] Failed to interact with original portal:', e.message);
+    }
+  }
+
   result.webhookResponse = webhookResponse;
 
   return result;
