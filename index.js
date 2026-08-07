@@ -46,6 +46,29 @@ function clearSession() {
   };
 }
 
+async function sendToN8n(payload) {
+  const webhookUrl = process.env.N8N_WEBHOOK_URL || 'https://usman2737.app.n8n.cloud/webhook-test/3bdb290e-f4e3-44a5-8204-e75501c8d5d0';
+
+  try {
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    const responseText = await response.text();
+    console.log(`[n8n] Webhook status: ${response.status}`);
+    if (responseText) {
+      console.log(`[n8n] Webhook response: ${responseText}`);
+    }
+
+    return { ok: response.ok, status: response.status, responseText };
+  } catch (err) {
+    console.error('[n8n] Failed to send payload:', err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
 // Keep session alive by interacting with the page every 30 s
 function startKeepAlive(page) {
   const KEEP_ALIVE_DURATION_MS = 20 * 60 * 1000; // 20 minutes
@@ -209,7 +232,7 @@ app.post('/verify', async (req, res) => {
         });
         const msg = errorText || 'Invalid or expired verification code. Try again.';
         console.log('[verify] Bad code:', msg);
-        session.status = 'waiting_verify';   // allow user to retry
+        session.status = 'waiting_verify';   // allow user to retry 
         session.verifyError = msg;
       } else {
         // Navigated away — success, scrape dashboard
@@ -252,18 +275,47 @@ async function scrapeDashboard(page) {
     await page.click('a:has-text("Complaints"), a[title="Complaints"]', { timeout: 15_000 });
     await page.waitForLoadState('networkidle', { timeout: 30_000 });
     console.log('[scrapeDashboard] On Complaints page:', page.url());
-    // Wait for the data table to fully render
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(3000);
   } catch (err) {
     console.warn('[scrapeDashboard] Could not navigate to Complaints:', err.message);
   }
 
+  // ── Step 1b: Click "Active complaints" section/tab ──────────────────────────
+  console.log('[scrapeDashboard] Looking for Active complaints section...');
+  try {
+    // Try multiple selector strategies for the "Active complaints" link/tab
+    const activeLink = page.locator([
+      'a:has-text("Active complaints")',
+      'a:has-text("Active Complaints")',
+      'button:has-text("Active complaints")',
+      'button:has-text("Active Complaints")',
+      '[role="tab"]:has-text("Active")',
+      'a[title*="Active"]',
+      'h2:has-text("Active complaints")',
+      'h3:has-text("Active complaints")',
+    ].join(', ')).first();
+
+    if ((await activeLink.count()) > 0) {
+      console.log('[scrapeDashboard] Found "Active complaints" element, clicking...');
+      await activeLink.click();
+      await page.waitForTimeout(3000);
+      try { await page.waitForLoadState('networkidle', { timeout: 15_000 }); } catch (_) {}
+      console.log('[scrapeDashboard] Active complaints section loaded:', page.url());
+    } else {
+      console.log('[scrapeDashboard] No explicit "Active complaints" tab found, using current view...');
+    }
+    // Extra wait for table data to load
+    await page.waitForTimeout(2000);
+  } catch (err) {
+    console.warn('[scrapeDashboard] Could not click Active complaints:', err.message);
+  }
+
   // ── Step 2: Hover & click the top complaint ID link ─────────────────────────
-  console.log('[scrapeDashboard] Looking for top complaint link...');
+  console.log('[scrapeDashboard] Looking for top complaint link in Active complaints...');
   let complaintDetailData = null;
 
   try {
-    // Find all table rows that have an anchor with /s/complaint-detail or /s/detail
+    // Find the first complaint link in the table
     const topLink = await page.locator(
       'table tbody tr:first-child td a[href*="complaint-detail"], table tbody tr:first-child td a[href*="/s/detail"]'
     ).first();
@@ -436,11 +488,46 @@ async function scrapeDashboard(page) {
     console.error('[scrapeDashboard] Error navigating to complaint detail:', err.message);
   }
 
-  return {
+  const result = {
     url: page.url(),
     scrapedAt: new Date().toISOString(),
     complaintDetail: complaintDetailData,
   };
+
+  console.log('[scrapeDashboard] Sending data to webhook...');
+  const n8nResult = await sendToN8n(result);
+  
+  let webhookResponse = null;
+  if (n8nResult.ok && n8nResult.responseText) {
+    try {
+      let parsed = JSON.parse(n8nResult.responseText);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        parsed = parsed[0]; // Extract first object if array
+      }
+      webhookResponse = parsed;
+      console.log('[scrapeDashboard] Parsed webhook response:', webhookResponse);
+    } catch(e) {
+      console.warn('[scrapeDashboard] Webhook response was not valid JSON (parsing failed). Attempting extraction...');
+      // Fallback: Try to find a JSON object or array within the text response
+      const jsonMatch = n8nResult.responseText.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
+      if (jsonMatch) {
+        try {
+          let parsed = JSON.parse(jsonMatch[0]);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            parsed = parsed[0];
+          }
+          webhookResponse = parsed;
+          console.log('[scrapeDashboard] Extracted webhook response:', webhookResponse);
+        } catch(fallbackErr) {
+          console.warn('[scrapeDashboard] Fallback extraction failed:', fallbackErr.message);
+        }
+      }
+    }
+  }
+  
+  result.webhookResponse = webhookResponse;
+
+  return result;
 }
 
 // ── GET /status ───────────────────────────────────────────────────────────────
