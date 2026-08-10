@@ -216,20 +216,38 @@ app.post('/verify', async (req, res) => {
       //   B) page stays on TotpVerification (reloads with error) → bad code
       console.log('[verify] Submitting code…');
 
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }),
-        page.click('input[type="submit"]#save'),
-      ]);
+      await page.click('input[type="submit"]#save');
 
+      // Safely wait for either navigation away from the verify page OR an error message to appear
+      try {
+        await page.waitForFunction(() => {
+          const url = window.location.href;
+          const errorEl = document.getElementById('tc-error') || document.querySelector('.errorMsg, [class*="error"]');
+          const hasError = errorEl && errorEl.innerText.trim().length > 0;
+          const leftVerifyPage = !url.includes('TotpVerification') && !url.includes('challenge') && !url.includes('mfa') && !url.includes('otp');
+          return hasError || leftVerifyPage;
+        }, { timeout: 30_000 });
+      } catch (err) {
+        console.warn('[verify] waitForFunction timed out, checking state anyway...');
+      }
+
+      await page.waitForTimeout(1000); // Give DOM a moment to settle
       const currentUrl = page.url();
       console.log('[verify] After submit URL:', currentUrl);
 
-      if (currentUrl.includes('TotpVerification')) {
-        // Page reloaded with an error — read the exact error text from the site
-        const errorText = await page.evaluate(() => {
-          const el = document.getElementById('tc-error');
+      // Check if we are still on the verify page or if an error is visible
+      let errorText = null;
+      try {
+        errorText = await page.evaluate(() => {
+          const el = document.getElementById('tc-error') || document.querySelector('.errorMsg');
           return el ? el.innerText.trim() : null;
         });
+      } catch (e) {
+        // If evaluate throws, it means the page is actively navigating away (success)
+        console.log('[verify] Navigation in progress, skipping error text check.');
+      }
+
+      if (errorText || currentUrl.includes('TotpVerification') || currentUrl.includes('challenge') || currentUrl.includes('mfa')) {
         const msg = errorText || 'Invalid or expired verification code. Try again.';
         console.log('[verify] Bad code:', msg);
         session.status = 'waiting_verify';   // allow user to retry 
