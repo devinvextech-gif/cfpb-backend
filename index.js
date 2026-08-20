@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const { chromium } = require('playwright');
 
@@ -60,20 +61,24 @@ process.on('uncaughtException', (err) => failSession('Uncaught exception', err))
 process.on('unhandledRejection', (reason) => failSession('Unhandled rejection', reason));
 
 async function sendToN8n(payload) {
-  const webhookUrl = process.env.N8N_WEBHOOK_URL || 'https://usman2737.app.n8n.cloud/webhook-test/3bdb290e-f4e3-44a5-8204-e75501c8d5d0';
+  const webhookUrl = process.env.N8N_WEBHOOK_URL?.trim();
+
+  if (!webhookUrl) {
+    const error = 'N8N_WEBHOOK_URL is not configured in the backend environment.';
+    console.error(`[n8n] ${error}`);
+    return { ok: false, error };
+  }
 
   try {
+    const jsonPayload = JSON.stringify(payload);
     const response = await fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: jsonPayload,
     });
 
     const responseText = await response.text();
-    console.log(`[n8n] Webhook status: ${response.status}`);
-    if (responseText) {
-      console.log(`[n8n] Webhook response: ${responseText}`);
-    }
+    console.log(`[n8n] Webhook status: ${response.status}; payload size: ${Buffer.byteLength(jsonPayload)} bytes.`);
 
     return { ok: response.ok, status: response.status, responseText };
   } catch (err) {
@@ -146,7 +151,7 @@ app.post('/start', async (req, res) => {
         waitUntil: 'networkidle',
         timeout: 60_000,
       });
-      console.log('[start] Landed on:', session.page.url());
+      console.log('[start] Login page loaded.');
 
       // Fill email — Salesforce uses dynamic IDs; target by placeholder
       console.log('[start] Filling email…');
@@ -168,7 +173,7 @@ app.post('/start', async (req, res) => {
         (url) => !url.toString().includes('/login'),
         { timeout: 60_000 }
       );
-      console.log('[start] Redirected to:', session.page.url());
+      console.log('[start] Post-login page loaded.');
 
       // Detect where we landed: MFA/verify page or directly on dashboard
       const postLoginUrl = session.page.url();
@@ -186,7 +191,9 @@ app.post('/start', async (req, res) => {
         session.dashboardData = data;
         session.status = 'done';
         session.active = false;
-        if (session.browser) session.browser.close().catch(() => { });
+        clearSession();
+        session.dashboardData = data;
+        session.status = 'done';
       }
     } catch (err) {
       console.error('[start] Error:', err.message);
@@ -246,7 +253,7 @@ app.post('/verify', async (req, res) => {
 
       await page.waitForTimeout(1000); // Give DOM a moment to settle
       const currentUrl = page.url();
-      console.log('[verify] After submit URL:', currentUrl);
+      console.log('[verify] Verification response processed.');
 
       // Check if we are still on the verify page or if an error is visible
       let errorText = null;
@@ -281,14 +288,14 @@ app.post('/verify', async (req, res) => {
 
 // ── Handle successful verification ───────────────────────────────────────────
 async function handleVerifySuccess(page) {
-  console.log('[verify] Success! Landed on:', page.url());
+  console.log('[verify] Verification succeeded.');
   if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
   session.verifyError = null;
   session.status = 'scraping';
   const data = await scrapeDashboard(page);
+  clearSession();
   session.dashboardData = data;
   session.status = 'done';
-  session.active = false;
   console.log('[verify] Done. Dashboard data scraped.');
 }
 
@@ -298,14 +305,14 @@ async function scrapeDashboard(page) {
     await page.waitForLoadState('networkidle', { timeout: 30_000 });
   } catch (_) { /* best effort */ }
 
-  console.log('[scrapeDashboard] Landed on dashboard:', page.url());
+  console.log('[scrapeDashboard] Dashboard loaded.');
 
   // ── Step 1: Navigate to Complaints tab ──────────────────────────────────────
   console.log('[scrapeDashboard] Clicking Complaints tab...');
   try {
     await page.click('a:has-text("Complaints"), a[title="Complaints"]', { timeout: 15_000 });
     await page.waitForLoadState('networkidle', { timeout: 30_000 });
-    console.log('[scrapeDashboard] On Complaints page:', page.url());
+    console.log('[scrapeDashboard] Complaints page loaded.');
     await page.waitForTimeout(3000);
   } catch (err) {
     console.warn('[scrapeDashboard] Could not navigate to Complaints:', err.message);
@@ -331,7 +338,7 @@ async function scrapeDashboard(page) {
       await activeLink.click();
       await page.waitForTimeout(3000);
       try { await page.waitForLoadState('networkidle', { timeout: 15_000 }); } catch (_) {}
-      console.log('[scrapeDashboard] Active complaints section loaded:', page.url());
+      console.log('[scrapeDashboard] Active complaints section loaded.');
     } else {
       console.log('[scrapeDashboard] No explicit "Active complaints" tab found, using current view...');
     }
@@ -359,8 +366,7 @@ async function scrapeDashboard(page) {
 
     if ((await link.count()) > 0) {
       const complaintId = (await link.innerText()).trim();
-      const detailHref = await link.getAttribute('href');
-      console.log(`[scrapeDashboard] Hovering over top complaint: ${complaintId} -> ${detailHref}`);
+      console.log(`[scrapeDashboard] Found complaint ${complaintId}.`);
 
       // Hover first to trigger any tooltip/preview
       await link.hover();
@@ -378,7 +384,7 @@ async function scrapeDashboard(page) {
       try { await page.waitForLoadState('networkidle', { timeout: 15_000 }); } catch (_) {}
 
       const detailUrl = page.url();
-      console.log('[scrapeDashboard] Detail page URL:', detailUrl);
+      console.log('[scrapeDashboard] Complaint detail page loaded.');
 
       // ── Step 3: Extract all complaint detail data ──────────────────────────
       complaintDetailData = await page.evaluate(() => {
@@ -525,8 +531,16 @@ async function scrapeDashboard(page) {
     complaintDetail: complaintDetailData,
   };
 
+  if (!complaintDetailData || Object.keys(complaintDetailData).length === 0) {
+    throw new Error('Complaint details were not extracted; webhook delivery was skipped.');
+  }
+
   console.log('[scrapeDashboard] Sending data to webhook...');
   const n8nResult = await sendToN8n(result);
+  if (!n8nResult.ok) {
+    throw new Error(n8nResult.error || `Webhook request failed with status ${n8nResult.status}`);
+  }
+  console.log('[scrapeDashboard] Webhook accepted the complaint data.');
   
   let webhookResponse = null;
   if (n8nResult.ok && n8nResult.responseText) {
@@ -577,7 +591,7 @@ async function scrapeDashboard(page) {
         const textarea = page.locator('textarea').first();
         if ((await textarea.count()) > 0) {
           await textarea.fill(webhookResponse.complaint_response);
-          console.log(`[scrapeDashboard] ✔ Pasted the following text into the original portal textarea:\n\n${webhookResponse.complaint_response}\n`);
+          console.log('[scrapeDashboard] ✔ Added the webhook response to the portal form.');
           console.log('[scrapeDashboard] Note: Response was NOT submitted per instructions.');
         } else {
           console.warn('[scrapeDashboard] ⚠ Textarea not found after clicking the option.');
@@ -620,4 +634,4 @@ app.post('/reset', (req, res) => {
 
 // ── Start server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`CFPB backend listening on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`[server] CFPB backend listening on port ${PORT}.`));

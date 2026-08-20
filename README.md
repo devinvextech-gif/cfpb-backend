@@ -36,6 +36,14 @@ vercel --prod
 
 ## ⚙️ Environment Variables
 
+For local development, create `cfpb-backend/.env` with the webhook URL:
+
+```env
+N8N_WEBHOOK_URL=https://your-n8n-host/webhook/your-webhook-id
+```
+
+The backend loads this file with `dotenv` at startup. Restart the backend after changing it. Keep `.env` out of source control and use Vercel's Environment Variables settings for deployments.
+
 After deployment, add these environment variables in Vercel Dashboard:
 
 - `N8N_WEBHOOK_URL` - Your N8N webhook URL (if different from default)
