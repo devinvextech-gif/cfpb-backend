@@ -1,0 +1,20 @@
+# Git
+.git
+.gitignore
+
+# Local env — set secrets as environment variables in Render's dashboard
+.env
+
+# Dev/test files
+test.js
+*.log
+
+# Render/Vercel config files not needed inside the container
+vercel.json
+.vercelignore
+
+# Downloads folder (generated at runtime)
+downloads/
+
+# Node modules (rebuilt inside the container)
+node_modules/
