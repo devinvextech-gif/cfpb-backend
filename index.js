@@ -1,5 +1,14 @@
+require('dotenv').config();
 const express = require('express');
 const { chromium } = require('playwright');
+
+const CFPB_EMAIL = process.env.CFPB_EMAIL;
+const CFPB_PASSWORD = process.env.CFPB_PASSWORD;
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
+
+if (!CFPB_EMAIL || !CFPB_PASSWORD || !N8N_WEBHOOK_URL) {
+  throw new Error('CFPB_EMAIL, CFPB_PASSWORD, and N8N_WEBHOOK_URL must be configured');
+}
 
 const app = express();
 app.use(express.json());
@@ -20,14 +29,15 @@ app.use((req, res, next) => {
 // ── Session state ─────────────────────────────────────────────────────────────
 let session = {
   active: false,
-  status: 'idle',
+  status: 'idle',         // idle | launching | waiting_verify | verifying | waiting_email_verify | verifying_email | scraping | done | error
   browser: null,
   page: null,
   keepAliveTimer: null,
   keepAliveExpiry: null,
-  dashboardData: null,
   error: null,
-  verifyError: null,   // inline error from the verify page (bad code)
+  verifyError: null,      // inline error from the TOTP verify page (bad code)
+  emailVerifyError: null, // inline error from the email verify page (bad code)
+  emailCodePrefix: null,  // e.g. "JFH-" — pre-filled prefix shown on the email code screen
 };
 
 function clearSession() {
@@ -40,33 +50,21 @@ function clearSession() {
     page: null,
     keepAliveTimer: null,
     keepAliveExpiry: null,
-    dashboardData: null,
     error: null,
     verifyError: null,
+    emailVerifyError: null,
+    emailCodePrefix: null,
   };
 }
 
-async function sendToN8n(payload) {
-  const webhookUrl = process.env.N8N_WEBHOOK_URL || 'https://usman2737.app.n8n.cloud/webhook-test/3bdb290e-f4e3-44a5-8204-e75501c8d5d0';
-
-  try {
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-
-    const responseText = await response.text();
-    console.log(`[n8n] Webhook status: ${response.status}`);
-    if (responseText) {
-      console.log(`[n8n] Webhook response: ${responseText}`);
-    }
-
-    return { ok: response.ok, status: response.status, responseText };
-  } catch (err) {
-    console.error('[n8n] Failed to send payload:', err.message);
-    return { ok: false, error: err.message };
-  }
+function sendToN8n(payload) {
+  void fetch(N8N_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+    .then((response) => console.log(`[n8n] Webhook request accepted with status: ${response.status}`))
+    .catch((err) => console.error('[n8n] Failed to send payload:', err.message));
 }
 
 // Keep session alive by interacting with the page every 30 s
@@ -111,7 +109,6 @@ app.post('/start', async (req, res) => {
   session.status = 'launching';
   session.error = null;
   session.verifyError = null;
-  session.dashboardData = null;
 
   res.json({ message: 'Session starting…' });
 
@@ -138,12 +135,12 @@ app.post('/start', async (req, res) => {
       // Fill email — Salesforce uses dynamic IDs; target by placeholder
       console.log('[start] Filling email…');
       await session.page.waitForSelector('input[placeholder="Email Address"]', { timeout: 30_000 });
-      await session.page.fill('input[placeholder="Email Address"]', 'usman.m@waypoint.com');
+      await session.page.fill('input[placeholder="Email Address"]', CFPB_EMAIL);
 
       // Fill password
       console.log('[start] Filling password…');
       await session.page.waitForSelector('input[placeholder="Password"]', { timeout: 15_000 });
-      await session.page.fill('input[placeholder="Password"]', 'Team2026!!Team2026!!');
+      await session.page.fill('input[placeholder="Password"]', CFPB_PASSWORD);
 
       // Click Log in button
       console.log('[start] Submitting login…');
@@ -169,11 +166,8 @@ app.post('/start', async (req, res) => {
         // Landed directly on dashboard — no MFA needed, scrape immediately
         console.log('[start] No MFA required, scraping dashboard…');
         session.status = 'scraping';
-        const data = await scrapeDashboard(session.page);
-        session.dashboardData = data;
-        session.status = 'done';
-        session.active = false;
-        if (session.browser) session.browser.close().catch(() => { });
+        await scrapeDashboard(session.page);
+        clearSession();
       }
     } catch (err) {
       console.error('[start] Error:', err.message);
@@ -266,17 +260,66 @@ app.post('/verify', async (req, res) => {
   })();
 });
 
-// ── Handle successful verification ───────────────────────────────────────────
+// ── Handle successful TOTP verification ──────────────────────────────────────
+// After TOTP passes, the portal may show a second email-code screen on the
+// first login of the day.  Detect it and pause for user input if needed.
 async function handleVerifySuccess(page) {
-  console.log('[verify] Success! Landed on:', page.url());
+  console.log('[verify] TOTP accepted! Landed on:', page.url());
   if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
   session.verifyError = null;
+
+  // Give the page a moment to settle after the TOTP redirect
+  await page.waitForTimeout(3000);
+
+  // Check if we landed on the email verification screen (loginFlow)
+  const isEmailScreen = await detectEmailVerificationScreen(page);
+
+  if (isEmailScreen) {
+    console.log('[verify] Email verification screen detected — pausing for email code.');
+
+    // Read the pre-filled prefix from the input (e.g. "JFH-")
+    let prefix = '';
+    try {
+      const inputEl = await page.$('#thePage\\:j_id2\\:i\\:f\\:pb\\:d\\:CodeInput\\.input');
+      if (inputEl) {
+        prefix = await inputEl.inputValue();
+      } else {
+        prefix = await page.inputValue('[name="thePage:j_id2:i:f:pb:d:element___input____CodeInput"]').catch(() => '');
+      }
+    } catch { /* ignore */ }
+
+    session.emailCodePrefix = prefix || null;
+    session.status = 'waiting_email_verify';
+    session.active = true; // keep session alive
+    startKeepAlive(page);  // restart the keep-alive timer for the new wait window
+    return;
+  }
+
+  // No email screen — proceed directly to scraping
+  await proceedToScrape(page);
+}
+
+// ── Proceed to scrape (shared by both verify paths) ──────────────────────────
+async function proceedToScrape(page) {
   session.status = 'scraping';
-  const data = await scrapeDashboard(page);
-  session.dashboardData = data;
-  session.status = 'done';
-  session.active = false;
-  console.log('[verify] Done. Dashboard data scraped.');
+  await scrapeDashboard(page);
+  clearSession();
+  console.log('[scrape] Done. Data sent to webhook and session reset.');
+}
+
+// ── Detect the email verification screen ─────────────────────────────────────
+async function detectEmailVerificationScreen(page) {
+  try {
+    // Primary: the specific input field ID from the CFPB loginFlow page
+    const inputEl = await page.$('#thePage\\:j_id2\\:i\\:f\\:pb\\:d\\:CodeInput\\.input');
+    if (inputEl) return true;
+    // Fallback: body text contains both marker phrases
+    const bodyText = await page.textContent('body').catch(() => '');
+    if (bodyText.includes('Enter your verification code') && bodyText.includes('emailed to you')) return true;
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 // ── Dashboard scraper ─────────────────────────────────────────────────────────
@@ -513,75 +556,104 @@ async function scrapeDashboard(page) {
   };
 
   console.log('[scrapeDashboard] Sending data to webhook...');
-  const n8nResult = await sendToN8n(result);
-  
-  let webhookResponse = null;
-  if (n8nResult.ok && n8nResult.responseText) {
-    try {
-      let parsed = JSON.parse(n8nResult.responseText);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        parsed = parsed[0]; // Extract first object if array
-      }
-      webhookResponse = parsed;
-      console.log('[scrapeDashboard] Parsed webhook response as JSON.');
-    } catch(e) {
-      console.warn('[scrapeDashboard] Webhook response is not standard JSON. Attempting extraction...');
-      // Fallback: Try to find a JSON object or array within the text response
-      const jsonMatch = n8nResult.responseText.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
-      let extracted = false;
-      if (jsonMatch) {
-        try {
-          let parsed = JSON.parse(jsonMatch[0]);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            parsed = parsed[0];
-          }
-          webhookResponse = parsed;
-          extracted = true;
-          console.log('[scrapeDashboard] Extracted webhook response from text.');
-        } catch(fallbackErr) {}
-      }
-      
-      // If it's pure raw text (like the logs show), wrap it so the rest of the code works
-      if (!extracted) {
-        console.log('[scrapeDashboard] Webhook returned raw text. Wrapping it automatically.');
-        webhookResponse = { complaint_response: n8nResult.responseText.trim() };
-      }
-    }
-  }
-  
-  if (webhookResponse && webhookResponse.complaint_response) {
-    try {
-      console.log('\n[scrapeDashboard] --- Automating Original Portal Response ---');
-      
-      const optionLabel = page.locator('label:has-text("Closed with explanation"), [role="radio"]:has-text("Closed with explanation"), span:has-text("Closed with explanation")').first();
-      
-      if ((await optionLabel.count()) > 0) {
-        await optionLabel.click();
-        console.log('[scrapeDashboard] ✔ Clicked option: "Closed with explanation"');
-        
-        await page.waitForTimeout(1500); // Wait for textarea to appear
-        
-        const textarea = page.locator('textarea').first();
-        if ((await textarea.count()) > 0) {
-          await textarea.fill(webhookResponse.complaint_response);
-          console.log(`[scrapeDashboard] ✔ Pasted the following text into the original portal textarea:\n\n${webhookResponse.complaint_response}\n`);
-          console.log('[scrapeDashboard] Note: Response was NOT submitted per instructions.');
-        } else {
-          console.warn('[scrapeDashboard] ⚠ Textarea not found after clicking the option.');
-        }
-      } else {
-         console.warn('[scrapeDashboard] ⚠ Could not find the "Closed with explanation" option on the page.');
-      }
-      console.log('[scrapeDashboard] ---------------------------------------------\n');
-    } catch (e) {
-      console.error('[scrapeDashboard] Failed to interact with original portal:', e.message);
-    }
-  }
-
-  result.webhookResponse = webhookResponse;
+  sendToN8n(result);
 
   return result;
 }
+
+// ── POST /verify-email ────────────────────────────────────────────────────────
+// Receives the full email verification code (e.g. "JFH-123456") and enters it
+// into the active Playwright session that is paused on the loginFlow page.
+app.post('/verify-email', async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: 'code is required' });
+  if (!session.active) return res.status(409).json({ error: 'No active session' });
+  if (session.status !== 'waiting_email_verify') {
+    return res.status(409).json({ error: `Session is in state "${session.status}", not waiting for email code` });
+  }
+
+  session.status = 'verifying_email';
+  session.emailVerifyError = null;
+  res.json({ message: 'Email verification code received, processing…' });
+
+  (async () => {
+    try {
+      const page = session.page;
+      console.log('[verify-email] Entering email code…');
+
+      // Fill the code input — clear the pre-filled prefix first
+      let filled = false;
+      try {
+        const inputEl = await page.$('#thePage\\:j_id2\\:i\\:f\\:pb\\:d\\:CodeInput\\.input');
+        if (inputEl) {
+          await inputEl.click({ clickCount: 3 }); // select all
+          await inputEl.fill(code.trim());
+          filled = true;
+        }
+      } catch { /* try fallback */ }
+
+      if (!filled) {
+        await page.click('[name="thePage:j_id2:i:f:pb:d:element___input____CodeInput"]', { clickCount: 3 });
+        await page.fill('[name="thePage:j_id2:i:f:pb:d:element___input____CodeInput"]', code.trim());
+      }
+
+      // Click the Next button
+      console.log('[verify-email] Clicking Next…');
+      try {
+        await page.click('#thePage\\:j_id2\\:i\\:f\\:pb\\:pbb\\:nextAjax');
+      } catch {
+        await page.click('input[value="Next"], button:has-text("Next")');
+      }
+
+      // Wait for either: navigation away from loginFlow (success) OR an error appearing
+      try {
+        await page.waitForFunction(() => {
+          const url = window.location.href;
+          const leftFlow = !url.includes('loginFlow');
+          // Look for any visible error message on the page
+          const errEl = document.querySelector('[class*="error"], .errorMsg, .pbError');
+          const hasError = errEl && errEl.innerText.trim().length > 0;
+          return leftFlow || hasError;
+        }, { timeout: 30_000 });
+      } catch {
+        console.warn('[verify-email] waitForFunction timed out, checking state…');
+      }
+
+      await page.waitForTimeout(1500);
+      const currentUrl = page.url();
+      console.log('[verify-email] Post-submit URL:', currentUrl);
+
+      // Check for an inline error (wrong code)
+      let errorText = null;
+      try {
+        errorText = await page.evaluate(() => {
+          const el = document.querySelector('[class*="error"], .errorMsg, .pbError');
+          return el ? el.innerText.trim() : null;
+        });
+      } catch { /* navigation in progress = success */ }
+
+      if (errorText || currentUrl.includes('loginFlow')) {
+        const msg = errorText || 'Invalid or expired email verification code. Try again.';
+        console.log('[verify-email] Bad code:', msg);
+        session.status = 'waiting_email_verify'; // allow retry
+        session.emailVerifyError = msg;
+      } else {
+        // Success — proceed to scraping
+        console.log('[verify-email] Email verification accepted!');
+        if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
+        session.emailVerifyError = null;
+        session.emailCodePrefix = null;
+        await proceedToScrape(page);
+      }
+    } catch (err) {
+      console.error('[verify-email] Error:', err.message);
+      session.status = 'error';
+      session.error = err.message;
+      session.active = false;
+      if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
+    }
+  })();
+});
 
 // ── GET /status ───────────────────────────────────────────────────────────────
 app.get('/status', (req, res) => {
@@ -594,8 +666,9 @@ app.get('/status', (req, res) => {
     status: session.status,
     error: session.error,
     verifyError: session.verifyError,
+    emailVerifyError: session.emailVerifyError,
+    emailCodePrefix: session.emailCodePrefix,
     keepAliveSecondsLeft: secondsLeft,
-    dashboardData: session.dashboardData,
   });
 });
 
