@@ -5,13 +5,15 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node index.js"
+    "dev": "node index.js",
+    "postinstall": "playwright install chromium"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
     "content-disposition": "^3.0.0",
     "express": "^5.2.1",
-    "playwright": "^1.61.1"
+    "playwright": "^1.61.1",
+    "playwright-core": "^1.61.1"
   }
 }
