@@ -5,11 +5,12 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node index.js"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "content-disposition": "^3.0.0",
     "express": "^5.2.1",
     "playwright": "^1.61.1"
   }

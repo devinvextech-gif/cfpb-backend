@@ -46,6 +46,19 @@ function clearSession() {
   };
 }
 
+// Guard against any exception we didn't anticipate crashing the whole process
+function failSession(label, err) {
+  console.error(`[fatal] ${label}:`, err);
+  if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
+  if (session.browser) session.browser.close().catch(() => { });
+  session.status = 'error';
+  session.error = `Internal error: ${err && err.message ? err.message : err}`;
+  session.active = false;
+}
+
+process.on('uncaughtException', (err) => failSession('Uncaught exception', err));
+process.on('unhandledRejection', (reason) => failSession('Unhandled rejection', reason));
+
 async function sendToN8n(payload) {
   const webhookUrl = process.env.N8N_WEBHOOK_URL || 'https://usman2737.app.n8n.cloud/webhook-test/3bdb290e-f4e3-44a5-8204-e75501c8d5d0';
 
@@ -357,7 +370,7 @@ async function scrapeDashboard(page) {
       console.log(`[scrapeDashboard] Clicking complaint: ${complaintId}`);
       await Promise.all([
         page.waitForNavigation({ waitUntil: 'networkidle', timeout: 45_000 }).catch(() => {}),
-        link.click(),
+        link.click().catch(() => {}),
       ]);
 
       // Extra wait for Salesforce LWC components to fully render
