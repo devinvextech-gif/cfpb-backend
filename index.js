@@ -57,23 +57,31 @@ function clearSession() {
 async function getVerificationState(page) {
   return page.evaluate(() => {
     const bodyText = document.body?.innerText || '';
+    const normalizedText = bodyText.replace(/\s+/g, ' ');
     const hasCodeInput = Boolean(document.querySelector(
       'input#tc, input[name="tc"], input[id*="code" i][type="text"], input[autocomplete="one-time-code"]'
     ));
-    const emailChallenge = /first\s*3\s*letters|match the first|email verification|sent[\s\S]{0,120}email|code in your email/i.test(bodyText);
+    const emailChallenge = /first\s*3\s*letters|match the first(?:\s+3)?|email verification|sent.{0,120}email|code in your email/i.test(normalizedText);
     return {
       isVerificationPage: Boolean(hasCodeInput || /enter your verification code/i.test(bodyText)),
       isEmailChallenge: emailChallenge,
-      emailCodePrefix: bodyText.match(/first 3 letters[^\n]*?\b([A-Za-z]{3})\b/i)?.[1] || null,
+      emailCodePrefix: normalizedText.match(/first\s*3\s*letters.*?\b([A-Za-z]{3})\b/i)?.[1] || null,
     };
   });
 }
 
 async function submitVerificationForm(page, codeInput) {
   const form = codeInput.locator('xpath=ancestor::form[1]');
-  const submit = form.locator('input[type="submit"], button[type="submit"], button:has-text("Verify")').first();
-  await submit.waitFor({ state: 'visible', timeout: 30_000 });
-  await submit.click();
+  const formSubmit = form.locator('input[type="submit"], input[type="image"], button[type="submit"], button:has-text("Verify")').first();
+  const pageSubmit = page.locator('input[type="submit"]:visible, input[type="image"]:visible, button[type="submit"]:visible, button:has-text("Verify"):visible').first();
+
+  try {
+    await formSubmit.waitFor({ state: 'visible', timeout: 10_000 });
+    await formSubmit.click();
+  } catch (err) {
+    await pageSubmit.waitFor({ state: 'visible', timeout: 20_000 });
+    await pageSubmit.click();
+  }
 }
 
 // Guard against any exception we didn't anticipate crashing the whole process
