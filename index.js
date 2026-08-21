@@ -69,6 +69,13 @@ async function getVerificationState(page) {
   });
 }
 
+async function submitVerificationForm(page, codeInput) {
+  const form = codeInput.locator('xpath=ancestor::form[1]');
+  const submit = form.locator('input[type="submit"], button[type="submit"], button:has-text("Verify")').first();
+  await submit.waitFor({ state: 'visible', timeout: 30_000 });
+  await submit.click();
+}
+
 // Guard against any exception we didn't anticipate crashing the whole process
 function failSession(label, err) {
   console.error(`[fatal] ${label}:`, err);
@@ -197,7 +204,7 @@ app.post('/start', async (req, res) => {
       // Wait for either: MFA/verify page OR dashboard (in case MFA is skipped)
       console.log('[start] Waiting for post-login redirect…');
       await session.page.waitForURL(
-        (url) => !url.toString().includes('/login'),
+        (url) => !url.pathname.endsWith('/s/login/') && !url.pathname.endsWith('/s/login'),
         { timeout: 60_000 }
       );
       console.log('[start] Post-login page loaded.');
@@ -275,13 +282,14 @@ app.post('/verify', async (req, res) => {
       await codeInput.first().fill('');
       await codeInput.first().fill(code.trim().slice(0, 6));
 
-      // Submit — <input type="submit" id="save" value="Verify">
+      // Submit the form containing the active code input. CFPB can change the
+      // submit element's id after an invalid attempt.
       // The form does a full POST navigation, so we race:
       //   A) page navigates away from TotpVerification  → success
       //   B) page stays on TotpVerification (reloads with error) → bad code
       console.log('[verify] Submitting code…');
 
-      await page.click('input[type="submit"]#save');
+      await submitVerificationForm(page, codeInput.first());
 
       // Safely wait for either navigation away from the verify page OR an error message to appear
       try {
@@ -376,7 +384,7 @@ app.post('/verify-email', async (req, res) => {
       const codeInput = page.locator('input#tc:visible, input[name="tc"]:visible, input[id*="code" i][type="text"]:visible, input[autocomplete="one-time-code"]:visible').first();
       await codeInput.waitFor({ state: 'visible', timeout: 30_000 });
       await codeInput.fill(code.trim());
-      await page.locator('input[type="submit"]#save:visible, button[type="submit"]:visible').first().click();
+      await submitVerificationForm(page, codeInput);
 
         await page
           .waitForFunction(

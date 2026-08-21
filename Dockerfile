@@ -1,7 +1,7 @@
 # ── Stage 1: Use the official Playwright image ────────────────────────────────
 # This image is based on Ubuntu and ships with ALL browser dependencies
 # pre-installed, which is required for Chromium to work on Render.
-FROM mcr.microsoft.com/playwright:v1.52.0-noble
+FROM mcr.microsoft.com/playwright:v1.62.1-noble
 
 # Set working directory
 WORKDIR /app
@@ -13,8 +13,7 @@ COPY package.json package-lock.json ./
 # ci is clean/reproducible; skip postinstall so we control browser install below
 RUN npm ci --ignore-scripts
 
-# Install Chromium browser and its OS dependencies via Playwright
-RUN npx playwright install --with-deps chromium
+# The base image already contains the matching browser and OS dependencies.
 
 # Copy the rest of the application source
 COPY . .
