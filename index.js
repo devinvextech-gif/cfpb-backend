@@ -4,7 +4,7 @@ const { chromium } = require('playwright');
 
 const app = express();
 app.use(express.json());
-const APP_VERSION = '2fa-email-flow-2026-08-21-3';
+const APP_VERSION = '2fa-email-flow-2026-08-21-4';
 const CFPB_EMAIL = process.env.CFPB_EMAIL?.trim();
 const CFPB_PASSWORD = process.env.CFPB_PASSWORD;
 
@@ -75,15 +75,34 @@ async function getVerificationState(page) {
 
 async function submitVerificationForm(page, codeInput) {
   const form = codeInput.locator('xpath=ancestor::form[1]');
-  const formSubmit = form.locator('input[type="submit"], input[type="image"], button[type="submit"], button:has-text("Verify")').first();
-  const pageSubmit = page.locator('input[type="submit"]:visible, input[type="image"]:visible, button[type="submit"]:visible, button:has-text("Verify"):visible').first();
+  const submitSelector = 'input[type="submit"], input[type="image"], input[type="button"], button[type="submit"], button:has-text("Verify"), [role="button"]';
+  const formSubmit = form.locator(`${submitSelector}:visible`).first();
+  const pageSubmit = page.locator(`${submitSelector}:visible`).first();
 
   try {
-    await formSubmit.waitFor({ state: 'visible', timeout: 10_000 });
+    await formSubmit.waitFor({ state: 'visible', timeout: 5_000 });
     await formSubmit.click();
+    return;
   } catch (err) {
-    await pageSubmit.waitFor({ state: 'visible', timeout: 20_000 });
-    await pageSubmit.click();
+    try {
+      await pageSubmit.waitFor({ state: 'visible', timeout: 5_000 });
+      await pageSubmit.click();
+      return;
+    } catch (pageSubmitError) {
+      // Some CFPB login-flow variants expose only a text field. Let the
+      // browser submit its form through the field's native Enter behavior.
+      try {
+        await codeInput.press('Enter');
+        return;
+      } catch (enterError) {
+        try {
+          await form.evaluate((formElement) => formElement.requestSubmit());
+          return;
+        } catch (requestSubmitError) {
+          throw new Error(`Could not submit verification form: ${requestSubmitError.message}`);
+        }
+      }
+    }
   }
 }
 
