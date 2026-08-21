@@ -353,19 +353,36 @@ async function scrapeDashboard(page) {
   let complaintDetailData = null;
 
   try {
-    // Find the first complaint link in the table
-    const topLink = await page.locator(
-      'table tbody tr:first-child td a[href*="complaint-detail"], table tbody tr:first-child td a[href*="/s/detail"]'
-    ).first();
+    // Salesforce can render this list as a table or as hydrated LWC links.
+    // Wait for either shape instead of assuming the table exists immediately.
+    await page.waitForFunction(() => {
+      return [...document.querySelectorAll('a, [role="link"]')]
+        .some((el) => /complaint|detail/i.test(el.getAttribute('href') || '') || /\b\d{5,}\b/.test(el.innerText || ''));
+    }, { timeout: 30_000 }).catch(() => {
+      console.warn('[scrapeDashboard] Complaint list did not expose links within 30 seconds.');
+    });
 
-    // Fallback: any anchor in first data row of any table
-    let link = topLink;
+    // Select a real data row first. Portal navigation links can also contain
+    // "complaint" in their href, so a page-wide href selector is unreliable.
+    const dataRows = page.locator('table tbody tr, [role="row"]');
+    const rowCount = await dataRows.count();
+    let link = page.locator('a[href*="complaint-detail"], a[href*="/s/detail"], [role="link"][href*="complaint-detail"], [role="link"][href*="/s/detail"]').first();
+
+    for (let index = 0; index < rowCount && (await link.count()) === 0; index += 1) {
+      const row = dataRows.nth(index);
+      const rowText = (await row.innerText()).trim();
+      if (/\b\d{5,}\b/.test(rowText)) {
+        link = row.locator('a, button, [role="link"]:not([aria-disabled="true"])').first();
+      }
+    }
+
     if ((await link.count()) === 0) {
-      link = page.locator('table tr:nth-child(2) td a, table tbody tr:first-child td a').first();
+      link = page.locator('table tbody tr a, table tbody tr button, [role="row"] a, [role="row"] button').first();
     }
 
     if ((await link.count()) > 0) {
       const complaintId = (await link.innerText()).trim();
+      console.log(`[scrapeDashboard] Complaint candidate href: ${await link.getAttribute('href') || '(button/no href)'}`);
       console.log(`[scrapeDashboard] Found complaint ${complaintId}.`);
 
       // Hover first to trigger any tooltip/preview
@@ -519,7 +536,7 @@ async function scrapeDashboard(page) {
 
       console.log('[scrapeDashboard] Extracted detail data for:', complaintDetailData.complaintId);
     } else {
-      console.warn('[scrapeDashboard] No complaint links found in the table.');
+      console.warn(`[scrapeDashboard] No actionable complaint link found. rows=${rowCount}`);
     }
   } catch (err) {
     console.error('[scrapeDashboard] Error navigating to complaint detail:', err.message);
@@ -532,7 +549,15 @@ async function scrapeDashboard(page) {
   };
 
   if (!complaintDetailData || Object.keys(complaintDetailData).length === 0) {
-    throw new Error('Complaint details were not extracted; webhook delivery was skipped.');
+    const diagnostics = await page.evaluate(() => ({
+      title: document.title,
+      url: window.location.href,
+      anchors: document.querySelectorAll('a, [role="link"]').length,
+      tables: document.querySelectorAll('table, [role="table"]').length,
+      rows: document.querySelectorAll('table tbody tr, [role="row"]').length,
+      bodyText: (document.body?.innerText || '').trim().slice(0, 300),
+    })).catch(() => ({ title: '', url: page.url(), anchors: -1, tables: -1, rows: -1, bodyText: '' }));
+    throw new Error(`Complaint details were not extracted; webhook delivery was skipped. Page: ${diagnostics.title} (${diagnostics.url}); anchors=${diagnostics.anchors}, tables=${diagnostics.tables}, rows=${diagnostics.rows}; body="${diagnostics.bodyText}"`);
   }
 
   console.log('[scrapeDashboard] Sending data to webhook...');
