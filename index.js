@@ -297,7 +297,11 @@ app.post('/verify', async (req, res) => {
       //   B) page stays on TotpVerification (reloads with error) → bad code
       console.log('[verify] Submitting code…');
 
-      await submitVerificationForm(page, codeInput.first());
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {}),
+        submitVerificationForm(page, codeInput.first()),
+      ]);
+      await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
 
       // Safely wait for either navigation away from the verify page OR an error message to appear
       try {
@@ -314,7 +318,7 @@ app.post('/verify', async (req, res) => {
         console.warn('[verify] waitForFunction timed out, checking state anyway...');
       }
 
-      await page.waitForTimeout(1000); // Give DOM a moment to settle
+      await page.waitForTimeout(1000); // Give the next CFPB challenge time to hydrate
       const currentUrl = page.url();
       console.log('[verify] Verification response processed.');
 
@@ -336,12 +340,21 @@ app.post('/verify', async (req, res) => {
         emailCodePrefix: null,
       }));
 
-      if (verificationState.isEmailChallenge) {
+      if (!errorText && /loginflow/i.test(currentUrl)) {
+        await page.waitForFunction(() => {
+          const text = (document.body?.innerText || '').replace(/\s+/g, ' ');
+          return /first\s*3\s*letters|match the first|email verification|sent.{0,120}email|code in your email|invalid|expired|incorrect/i.test(text);
+        }, { timeout: 15_000 }).catch(() => {});
+      }
+
+      const settledVerificationState = await getVerificationState(page).catch(() => verificationState);
+
+      if (settledVerificationState.isEmailChallenge) {
         console.log('[verify] Email verification is required. Waiting for email code.');
         if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
         session.status = 'waiting_email_verify';
         session.emailVerifyError = null;
-        session.emailCodePrefix = verificationState.emailCodePrefix;
+        session.emailCodePrefix = settledVerificationState.emailCodePrefix;
         return;
       }
 
@@ -351,7 +364,19 @@ app.post('/verify', async (req, res) => {
         return Boolean(verificationForm || verificationText);
       }).catch(() => true);
 
-      if (errorText || stillOnVerificationPage || /TotpVerification|loginflow|challenge|mfa|otp/i.test(currentUrl)) {
+      // CFPB keeps the same loginflow URL for the optional email challenge and
+      // its page text is not consistent across browser runtimes. If the first
+      // submission produced no invalid-code message and the login flow remains
+      // active, expose the email-code form instead of asking for the first code again.
+      const likelyEmailChallenge = !errorText && stillOnVerificationPage && /loginflow/i.test(currentUrl);
+
+      if (likelyEmailChallenge) {
+        console.log('[verify] CFPB login flow remains active after a valid-looking code. Waiting for email code.');
+        if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
+        session.status = 'waiting_email_verify';
+        session.emailVerifyError = null;
+        session.emailCodePrefix = settledVerificationState.emailCodePrefix;
+      } else if (errorText || stillOnVerificationPage || /TotpVerification|loginflow|challenge|mfa|otp/i.test(currentUrl)) {
         const msg = errorText || (stillOnVerificationPage
           ? 'Verification was not completed. Check the code and try again.'
           : 'Invalid or expired verification code. Try again.');
