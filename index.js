@@ -4,6 +4,9 @@ const { chromium } = require('playwright');
 
 const app = express();
 app.use(express.json());
+const APP_VERSION = '2fa-email-flow-2026-08-21-1';
+const CFPB_EMAIL = process.env.CFPB_EMAIL?.trim();
+const CFPB_PASSWORD = process.env.CFPB_PASSWORD;
 
 // CORS — allow Vite dev server and same-origin requests
 app.use((req, res, next) => {
@@ -157,6 +160,9 @@ app.post('/start', async (req, res) => {
   // Run async — frontend polls /status
   (async () => {
     try {
+      if (!CFPB_EMAIL || !CFPB_PASSWORD) {
+        throw new Error('CFPB_EMAIL and CFPB_PASSWORD must be configured in the backend environment.');
+      }
       console.log('[start] Launching browser…');
       session.browser = await chromium.launch({ headless: true });
       const context = await session.browser.newContext({
@@ -177,12 +183,12 @@ app.post('/start', async (req, res) => {
       // Fill email — Salesforce uses dynamic IDs; target by placeholder
       console.log('[start] Filling email…');
       await session.page.waitForSelector('input[placeholder="Email Address"]', { timeout: 30_000 });
-      await session.page.fill('input[placeholder="Email Address"]', 'usman.m@waypoint.com');
+      await session.page.fill('input[placeholder="Email Address"]', CFPB_EMAIL);
 
       // Fill password
       console.log('[start] Filling password…');
       await session.page.waitForSelector('input[placeholder="Password"]', { timeout: 15_000 });
-      await session.page.fill('input[placeholder="Password"]', 'Team2026!!Team2026!!');
+      await session.page.fill('input[placeholder="Password"]', CFPB_PASSWORD);
 
       // Click Log in button
       console.log('[start] Submitting login…');
@@ -394,6 +400,26 @@ app.post('/verify-email', async (req, res) => {
 
 // ── Handle successful verification ───────────────────────────────────────────
 async function handleVerifySuccess(page) {
+  const verificationState = await getVerificationState(page).catch(() => ({
+    isVerificationPage: true,
+    isEmailChallenge: false,
+    emailCodePrefix: null,
+  }));
+  const stillInLoginFlow = /TotpVerification|loginflow|challenge|mfa|otp/i.test(page.url());
+
+  // This is the last boundary before scraping. Never scrape a CFPB 2FA page,
+  // even if an earlier navigation check classified it as successful.
+  if (verificationState.isEmailChallenge) {
+    console.log('[verify] Email verification is required. Waiting for email code.');
+    session.status = 'waiting_email_verify';
+    session.emailVerifyError = null;
+    session.emailCodePrefix = verificationState.emailCodePrefix;
+    return;
+  }
+  if (verificationState.isVerificationPage || stillInLoginFlow) {
+    throw new Error(`CFPB verification is still pending; scraping was blocked at ${page.url()}`);
+  }
+
   console.log('[verify] Verification succeeded.');
   if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
   session.verifyError = null;
@@ -763,6 +789,7 @@ app.get('/status', (req, res) => {
     : null;
 
   res.json({
+    appVersion: APP_VERSION,
     active: session.active,
     status: session.status,
     error: session.error,
