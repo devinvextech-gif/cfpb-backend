@@ -4,7 +4,7 @@ const { chromium } = require('playwright');
 
 const app = express();
 app.use(express.json());
-const APP_VERSION = '2fa-email-flow-2026-08-21-1';
+const APP_VERSION = '2fa-email-flow-2026-08-21-3';
 const CFPB_EMAIL = process.env.CFPB_EMAIL?.trim();
 const CFPB_PASSWORD = process.env.CFPB_PASSWORD;
 
@@ -60,7 +60,7 @@ async function getVerificationState(page) {
     const hasCodeInput = Boolean(document.querySelector(
       'input#tc, input[name="tc"], input[id*="code" i][type="text"], input[autocomplete="one-time-code"]'
     ));
-    const emailChallenge = /first 3 letters|email verification|sent .* email/i.test(bodyText);
+    const emailChallenge = /first\s*3\s*letters|match the first|email verification|sent[\s\S]{0,120}email|code in your email/i.test(bodyText);
     return {
       isVerificationPage: Boolean(hasCodeInput || /enter your verification code/i.test(bodyText)),
       isEmailChallenge: emailChallenge,
@@ -433,7 +433,10 @@ async function handleVerifySuccess(page) {
     return;
   }
   if (verificationState.isVerificationPage || stillInLoginFlow) {
-    throw new Error(`CFPB verification is still pending; scraping was blocked at ${page.url()}`);
+    console.log('[verify] CFPB verification is still pending. Waiting for another code.');
+    session.status = 'waiting_verify';
+    session.verifyError = 'The verification page is still active. Enter the current code and try again.';
+    return;
   }
 
   console.log('[verify] Verification succeeded.');
