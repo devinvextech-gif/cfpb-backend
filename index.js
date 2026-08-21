@@ -177,7 +177,7 @@ app.post('/start', async (req, res) => {
 
       // Detect where we landed: MFA/verify page or directly on dashboard
       const postLoginUrl = session.page.url();
-      const onVerifyPage = /TotpVerification|verify|mfa|otp|two-factor|totp|challenge/i.test(postLoginUrl);
+      const onVerifyPage = /TotpVerification|loginflow|verify|mfa|otp|two-factor|totp|challenge/i.test(postLoginUrl);
 
       if (onVerifyPage) {
         console.log('[start] On verification page, starting keep-alive…');
@@ -223,12 +223,30 @@ app.post('/verify', async (req, res) => {
     try {
       const page = session.page;
 
-      // Enter the OTP code — input#tc, maxlength 6
+      // Render can take longer to hydrate the CFPB login-flow form.
       console.log('[verify] Entering OTP code…');
-      await page.waitForSelector('input#tc', { timeout: 15_000 });
+      await page.waitForLoadState('domcontentloaded', { timeout: 30_000 }).catch(() => {});
+      const codeInput = page.locator('input#tc:visible, input[name="tc"]:visible, input[id*="code" i][type="text"]:visible, input[autocomplete="one-time-code"]:visible');
+      try {
+        await codeInput.first().waitFor({ state: 'visible', timeout: 30_000 });
+      } catch (err) {
+        const diagnostics = await page.evaluate(() => ({
+          url: window.location.href,
+          title: document.title,
+          inputs: [...document.querySelectorAll('input')].map((input) => ({
+            id: input.id,
+            name: input.name,
+            type: input.type,
+            visible: Boolean(input.offsetWidth || input.offsetHeight || input.getClientRects().length),
+          })),
+          bodyText: (document.body?.innerText || '').trim().slice(0, 300),
+        })).catch(() => ({ url: page.url(), title: '', inputs: [], bodyText: '' }));
+        throw new Error(`Verification form was not ready. Page: ${diagnostics.title} (${diagnostics.url}); inputs=${JSON.stringify(diagnostics.inputs)}; body="${diagnostics.bodyText}"`);
+      }
+
       // Clear field first then type
-      await page.fill('input#tc', '');
-      await page.fill('input#tc', code.trim().slice(0, 6));
+      await codeInput.first().fill('');
+      await codeInput.first().fill(code.trim().slice(0, 6));
 
       // Submit — <input type="submit" id="save" value="Verify">
       // The form does a full POST navigation, so we race:
@@ -244,8 +262,10 @@ app.post('/verify', async (req, res) => {
           const url = window.location.href;
           const errorEl = document.getElementById('tc-error') || document.querySelector('.errorMsg, [class*="error"]');
           const hasError = errorEl && errorEl.innerText.trim().length > 0;
-          const leftVerifyPage = !url.includes('TotpVerification') && !url.includes('challenge') && !url.includes('mfa') && !url.includes('otp');
-          return hasError || leftVerifyPage;
+          const verificationForm = document.querySelector('input#tc, input[name="tc"], input[id*="code" i][type="text"], input[autocomplete="one-time-code"]');
+          const verificationText = /enter your verification code|verification code was sent/i.test(document.body?.innerText || '');
+          const onVerificationPage = /TotpVerification|loginflow|challenge|mfa|otp/i.test(url) || verificationForm || verificationText;
+          return hasError || !onVerificationPage;
         }, { timeout: 30_000 });
       } catch (err) {
         console.warn('[verify] waitForFunction timed out, checking state anyway...');
@@ -267,8 +287,16 @@ app.post('/verify', async (req, res) => {
         console.log('[verify] Navigation in progress, skipping error text check.');
       }
 
-      if (errorText || currentUrl.includes('TotpVerification') || currentUrl.includes('challenge') || currentUrl.includes('mfa')) {
-        const msg = errorText || 'Invalid or expired verification code. Try again.';
+      const stillOnVerificationPage = await page.evaluate(() => {
+        const verificationForm = document.querySelector('input#tc, input[name="tc"], input[id*="code" i][type="text"], input[autocomplete="one-time-code"]');
+        const verificationText = /enter your verification code|verification code was sent/i.test(document.body?.innerText || '');
+        return Boolean(verificationForm || verificationText);
+      }).catch(() => true);
+
+      if (errorText || stillOnVerificationPage || /TotpVerification|loginflow|challenge|mfa|otp/i.test(currentUrl)) {
+        const msg = errorText || (stillOnVerificationPage
+          ? 'Verification was not completed. Check the code and try again.'
+          : 'Invalid or expired verification code. Try again.');
         console.log('[verify] Bad code:', msg);
         session.status = 'waiting_verify';   // allow user to retry 
         session.verifyError = msg;
@@ -368,7 +396,7 @@ async function scrapeDashboard(page) {
     const rowCount = await dataRows.count();
     let link = page.locator('a[href*="complaint-detail"], a[href*="/s/detail"], [role="link"][href*="complaint-detail"], [role="link"][href*="/s/detail"]').first();
 
-    for (let index = 0; index < rowCount && (await link.count()) === 0; index += 1) {
+    for (let index = 0; index < rowCount && (await link.count()) === 0; index += 1) { 
       const row = dataRows.nth(index);
       const cells = row.locator('td, [role="cell"]');
       const firstCellText = (await cells.first().innerText().catch(() => '')).trim();
