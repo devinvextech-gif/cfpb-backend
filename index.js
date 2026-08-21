@@ -362,26 +362,29 @@ async function scrapeDashboard(page) {
       console.warn('[scrapeDashboard] Complaint list did not expose links within 30 seconds.');
     });
 
-    // Select a real data row first. Portal navigation links can also contain
-    // "complaint" in their href, so a page-wide href selector is unreliable.
+    // Select a real data row first. Never fall back to arbitrary buttons because
+    // the page also contains verification and account-management controls.
     const dataRows = page.locator('table tbody tr, [role="row"]');
     const rowCount = await dataRows.count();
     let link = page.locator('a[href*="complaint-detail"], a[href*="/s/detail"], [role="link"][href*="complaint-detail"], [role="link"][href*="/s/detail"]').first();
 
     for (let index = 0; index < rowCount && (await link.count()) === 0; index += 1) {
       const row = dataRows.nth(index);
+      const cells = row.locator('td, [role="cell"]');
+      const firstCellText = (await cells.first().innerText().catch(() => '')).trim();
       const rowText = (await row.innerText()).trim();
-      if (/\b\d{5,}\b/.test(rowText)) {
-        link = row.locator('a, button, [role="link"]:not([aria-disabled="true"])').first();
+      const complaintIdMatch = firstCellText.match(/\b\d{5,}\b/) || rowText.match(/\b\d{5,}\b/);
+      if (complaintIdMatch) {
+        const rowLink = row.locator('a, [role="link"]:not([aria-disabled="true"])').first();
+        if ((await rowLink.count()) > 0) {
+          link = rowLink;
+        }
       }
-    }
-
-    if ((await link.count()) === 0) {
-      link = page.locator('table tbody tr a, table tbody tr button, [role="row"] a, [role="row"] button').first();
     }
 
     if ((await link.count()) > 0) {
       const complaintId = (await link.innerText()).trim();
+      const listUrl = page.url();
       console.log(`[scrapeDashboard] Complaint candidate href: ${await link.getAttribute('href') || '(button/no href)'}`);
       console.log(`[scrapeDashboard] Found complaint ${complaintId}.`);
 
@@ -401,7 +404,10 @@ async function scrapeDashboard(page) {
       try { await page.waitForLoadState('networkidle', { timeout: 15_000 }); } catch (_) {}
 
       const detailUrl = page.url();
-      console.log('[scrapeDashboard] Complaint detail page loaded.');
+      if (detailUrl === listUrl) {
+        throw new Error(`Complaint link did not navigate away from the list page: ${detailUrl}`);
+      }
+      console.log(`[scrapeDashboard] Complaint detail page loaded: ${detailUrl}`);
 
       // ── Step 3: Extract all complaint detail data ──────────────────────────
       complaintDetailData = await page.evaluate(() => {
@@ -548,7 +554,16 @@ async function scrapeDashboard(page) {
     complaintDetail: complaintDetailData,
   };
 
-  if (!complaintDetailData || Object.keys(complaintDetailData).length === 0) {
+  const hasComplaintDetails = complaintDetailData && (
+    complaintDetailData.complaintId ||
+    Object.keys(complaintDetailData.allFields || {}).length > 0 ||
+    Object.keys(complaintDetailData.sections || {}).length > 0 ||
+    Object.keys(complaintDetailData.sidebarItems || {}).length > 0 ||
+    complaintDetailData.narrative ||
+    complaintDetailData.attachments?.length > 0
+  );
+
+  if (!hasComplaintDetails) {
     const diagnostics = await page.evaluate(() => ({
       title: document.title,
       url: window.location.href,
