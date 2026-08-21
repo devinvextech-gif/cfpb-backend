@@ -29,6 +29,8 @@ let session = {
   dashboardData: null,
   error: null,
   verifyError: null,   // inline error from the verify page (bad code)
+  emailVerifyError: null,
+  emailCodePrefix: null,
 };
 
 function clearSession() {
@@ -44,7 +46,24 @@ function clearSession() {
     dashboardData: null,
     error: null,
     verifyError: null,
+    emailVerifyError: null,
+    emailCodePrefix: null,
   };
+}
+
+async function getVerificationState(page) {
+  return page.evaluate(() => {
+    const bodyText = document.body?.innerText || '';
+    const hasCodeInput = Boolean(document.querySelector(
+      'input#tc, input[name="tc"], input[id*="code" i][type="text"], input[autocomplete="one-time-code"]'
+    ));
+    const emailChallenge = /first 3 letters|email verification|sent .* email/i.test(bodyText);
+    return {
+      isVerificationPage: Boolean(hasCodeInput || /enter your verification code/i.test(bodyText)),
+      isEmailChallenge: emailChallenge,
+      emailCodePrefix: bodyText.match(/first 3 letters[^\n]*?\b([A-Za-z]{3})\b/i)?.[1] || null,
+    };
+  });
 }
 
 // Guard against any exception we didn't anticipate crashing the whole process
@@ -129,6 +148,8 @@ app.post('/start', async (req, res) => {
   session.status = 'launching';
   session.error = null;
   session.verifyError = null;
+  session.emailVerifyError = null;
+  session.emailCodePrefix = null;
   session.dashboardData = null;
 
   res.json({ message: 'Session starting…' });
@@ -287,6 +308,21 @@ app.post('/verify', async (req, res) => {
         console.log('[verify] Navigation in progress, skipping error text check.');
       }
 
+      const verificationState = await getVerificationState(page).catch(() => ({
+        isVerificationPage: true,
+        isEmailChallenge: false,
+        emailCodePrefix: null,
+      }));
+
+      if (verificationState.isEmailChallenge) {
+        console.log('[verify] Email verification is required. Waiting for email code.');
+        if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
+        session.status = 'waiting_email_verify';
+        session.emailVerifyError = null;
+        session.emailCodePrefix = verificationState.emailCodePrefix;
+        return;
+      }
+
       const stillOnVerificationPage = await page.evaluate(() => {
         const verificationForm = document.querySelector('input#tc, input[name="tc"], input[id*="code" i][type="text"], input[autocomplete="one-time-code"]');
         const verificationText = /enter your verification code|verification code was sent/i.test(document.body?.innerText || '');
@@ -306,6 +342,48 @@ app.post('/verify', async (req, res) => {
       }
     } catch (err) {
       console.error('[verify] Error:', err.message);
+      session.status = 'error';
+      session.error = err.message;
+      session.active = false;
+      if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
+    }
+  })();
+});
+
+// ── POST /verify-email ───────────────────────────────────────────────────────
+// Handles CFPB's optional email verification step after the first factor.
+app.post('/verify-email', async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: 'code is required' });
+  if (!session.active) return res.status(409).json({ error: 'No active session' });
+  if (session.status !== 'waiting_email_verify') {
+    return res.status(409).json({ error: `Session is in state "${session.status}", not waiting for email verification` });
+  }
+
+  session.status = 'verifying_email';
+  session.emailVerifyError = null;
+  res.json({ message: 'Email verification code received, processing…' });
+
+  (async () => {
+    try {
+      const page = session.page;
+      const codeInput = page.locator('input#tc:visible, input[name="tc"]:visible, input[id*="code" i][type="text"]:visible, input[autocomplete="one-time-code"]:visible').first();
+      await codeInput.waitFor({ state: 'visible', timeout: 30_000 });
+      await codeInput.fill(code.trim());
+      await page.locator('input[type="submit"]#save:visible, button[type="submit"]:visible').first().click();
+
+      await page.waitForTimeout(2_000);
+      const verificationState = await getVerificationState(page).catch(() => ({ isVerificationPage: true, isEmailChallenge: true, emailCodePrefix: null }));
+      if (verificationState.isVerificationPage) {
+        session.status = 'waiting_email_verify';
+        session.emailVerifyError = 'Email verification was not completed. Check the code and try again.';
+        session.emailCodePrefix = verificationState.emailCodePrefix || session.emailCodePrefix;
+        return;
+      }
+
+      await handleVerifySuccess(page);
+    } catch (err) {
+      console.error('[verify-email] Error:', err.message);
       session.status = 'error';
       session.error = err.message;
       session.active = false;
@@ -689,6 +767,8 @@ app.get('/status', (req, res) => {
     status: session.status,
     error: session.error,
     verifyError: session.verifyError,
+    emailVerifyError: session.emailVerifyError,
+    emailCodePrefix: session.emailCodePrefix,
     keepAliveSecondsLeft: secondsLeft,
     dashboardData: session.dashboardData,
   });
