@@ -62,10 +62,13 @@ async function getVerificationState(page) {
       'input#tc, input[name="tc"], input[id*="code" i][type="text"], input[autocomplete="one-time-code"]'
     ));
     const emailChallenge = /first\s*3\s*letters|match the first(?:\s+3)?|email verification|sent.{0,120}email|code in your email/i.test(normalizedText);
+    const prefixMatch = normalizedText.match(
+      /(?:first\s*3\s*letters|email code)(?:\s+(?:are|is|start with|starts with))?\s*[:=-]\s*([A-Za-z]{3})\b/i,
+    );
     return {
       isVerificationPage: Boolean(hasCodeInput || /enter your verification code/i.test(bodyText)),
       isEmailChallenge: emailChallenge,
-      emailCodePrefix: normalizedText.match(/first\s*3\s*letters.*?\b([A-Za-z]{3})\b/i)?.[1] || null,
+      emailCodePrefix: prefixMatch?.[1]?.toUpperCase() || null,
     };
   });
 }
