@@ -417,37 +417,54 @@ app.post('/verify-email', async (req, res) => {
   (async () => {
     try {
       const page = session.page;
-      const codeInput = page.locator('input#tc:visible, input[name="tc"]:visible, input[id*="code" i][type="text"]:visible, input[autocomplete="one-time-code"]:visible').first();
-      await codeInput.waitFor({ state: 'visible', timeout: 30_000 });
-      await codeInput.fill(code.trim());
-      await submitVerificationForm(page, codeInput);
+      const codeSelector = 'input#tc:visible, input[name="tc"]:visible, input[id*="code" i][type="text"]:visible, input[autocomplete="one-time-code"]:visible';
+      const submittedCode = code.trim();
 
-        await page
-          .waitForFunction(
-            () => {
-              const url = window.location.href;
-              const bodyText = document.body?.innerText || "";
-              const verificationForm = document.querySelector(
-                'input#tc, input[name="tc"], input[id*="code" i][type="text"], input[autocomplete="one-time-code"]',
-              );
-              const stillInLoginFlow = /TotpVerification|loginflow|challenge|mfa|otp/i.test(url);
-              const verificationText = /enter your verification code|verification code was sent|first\s*3\s*letters/i.test(bodyText);
-              return !stillInLoginFlow && !verificationForm && !verificationText;
-            },
-            { timeout: 30_000 },
-          )
-          .catch(() => {
-            console.warn('[verify-email] Verification response did not leave the login flow within 30 seconds.');
-          });
-      const verificationState = await getVerificationState(page).catch(() => ({ isVerificationPage: true, isEmailChallenge: true, emailCodePrefix: null }));
-      if (verificationState.isVerificationPage) {
-        session.status = 'waiting_email_verify';
-        session.emailVerifyError = 'Email verification was not completed. Check the code and try again.';
-        session.emailCodePrefix = verificationState.emailCodePrefix || session.emailCodePrefix;
-        return;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const codeInput = page.locator(codeSelector).first();
+        await codeInput.waitFor({ state: 'visible', timeout: 60_000 });
+        await codeInput.fill('');
+        await codeInput.fill(submittedCode);
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {}),
+          submitVerificationForm(page, codeInput),
+        ]);
+
+        await page.waitForFunction(
+          () => {
+            const url = window.location.href;
+            const bodyText = document.body?.innerText || '';
+            const verificationForm = document.querySelector(
+              'input#tc, input[name="tc"], input[id*="code" i][type="text"], input[autocomplete="one-time-code"]',
+            );
+            const stillInLoginFlow = /TotpVerification|loginflow|challenge|mfa|otp/i.test(url);
+            const verificationText = /enter your verification code|verification code was sent|first\s*3\s*letters|invalid|expired|incorrect/i.test(bodyText);
+            return (!stillInLoginFlow && !verificationForm && !verificationText) || verificationText;
+          },
+          { timeout: 60_000 },
+        ).catch(() => {
+          console.warn(`[verify-email] Attempt ${attempt} did not leave the login flow within 60 seconds.`);
+        });
+
+        const verificationState = await getVerificationState(page).catch(() => ({
+          isVerificationPage: true,
+          isEmailChallenge: true,
+          emailCodePrefix: null,
+        }));
+        if (!verificationState.isVerificationPage) {
+          await handleVerifySuccess(page);
+          return;
+        }
+
+        if (attempt === 1) {
+          console.warn('[verify-email] Email verification did not complete; retrying the submitted code.');
+          await page.waitForTimeout(500);
+        } else {
+          session.status = 'waiting_email_verify';
+          session.emailVerifyError = 'Email verification was not completed after retry. Check the code and try again.';
+          session.emailCodePrefix = verificationState.emailCodePrefix || session.emailCodePrefix;
+        }
       }
-
-      await handleVerifySuccess(page);
     } catch (err) {
       console.error('[verify-email] Error:', err.message);
       session.status = 'error';
