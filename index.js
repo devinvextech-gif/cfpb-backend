@@ -378,7 +378,23 @@ app.post('/verify-email', async (req, res) => {
       await codeInput.fill(code.trim());
       await page.locator('input[type="submit"]#save:visible, button[type="submit"]:visible').first().click();
 
-      await page.waitForTimeout(2_000);
+        await page
+          .waitForFunction(
+            () => {
+              const url = window.location.href;
+              const bodyText = document.body?.innerText || "";
+              const verificationForm = document.querySelector(
+                'input#tc, input[name="tc"], input[id*="code" i][type="text"], input[autocomplete="one-time-code"]',
+              );
+              const stillInLoginFlow = /TotpVerification|loginflow|challenge|mfa|otp/i.test(url);
+              const verificationText = /enter your verification code|verification code was sent|first\s*3\s*letters/i.test(bodyText);
+              return !stillInLoginFlow && !verificationForm && !verificationText;
+            },
+            { timeout: 30_000 },
+          )
+          .catch(() => {
+            console.warn('[verify-email] Verification response did not leave the login flow within 30 seconds.');
+          });
       const verificationState = await getVerificationState(page).catch(() => ({ isVerificationPage: true, isEmailChallenge: true, emailCodePrefix: null }));
       if (verificationState.isVerificationPage) {
         session.status = 'waiting_email_verify';
