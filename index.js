@@ -8,13 +8,9 @@ const APP_VERSION = '2fa-email-flow-2026-08-21-4';
 const CFPB_EMAIL = process.env.CFPB_EMAIL?.trim();
 const CFPB_PASSWORD = process.env.CFPB_PASSWORD;
 
-// CORS — allow Vite dev server and same-origin requests
+// CORS — allow requests from any origin
 app.use((req, res, next) => {
-  const allowed = ['https://cfpb-frontend.vercel.app/','http://127.0.0.1:5173'];
-  const origin = req.headers.origin;
-  if (allowed.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  }
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -880,6 +876,11 @@ async function scrapeDashboard(page) {
 
   return result;
 }
+
+// ── GET /health ──────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
 
 // ── GET /status ───────────────────────────────────────────────────────────────
 app.get('/status', (req, res) => {
