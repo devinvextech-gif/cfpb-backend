@@ -10,7 +10,7 @@ const CFPB_PASSWORD = process.env.CFPB_PASSWORD;
 
 // CORS — allow Vite dev server and same-origin requests
 app.use((req, res, next) => {
-  const allowed = ['http://localhost:5173', 'http://127.0.0.1:5173'];
+  const allowed = ['https://cfpb-frontend.vercel.app/','http://127.0.0.1:5173'];
   const origin = req.headers.origin;
   if (allowed.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
